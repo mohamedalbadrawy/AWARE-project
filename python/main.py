@@ -1,18 +1,19 @@
 # ============================================================
-#  python.py  —  Python/YOLOv8 Traffic Controller
+#  main.py  —  Python/YOLOv8 Traffic Controller
 #  مشروع: AI-Driven Smart Traffic Management System
 #
-#  ── المهمة ─────────────────────────────────────────────────
-#  1. قرا MJPEG stream من كاميرتين (ESP32-CAM) على port 81
-#  2. عد العربيات وتتبعها بـ YOLOv8 مع عرض الشاشة المباشر
-#  3. اكتشف الأسعاف بـ HSV Color Detection
-#  4. اكتشف مخالفات الإشارة الحمراء عند تخطي الخطوط الظاهرية
-#  5. ابعت النتيجة للـ ESP32 Main كل 2 ثانية
+#  ── المهام الأساسية ───────────────────────────────────────
+#  1. قراءة MJPEG stream من كاميرتين (ESP32-CAM) على port 81 (مع Fallback لفيديو محلي)
+#  2. عد المركبات وتتبعها بـ YOLOv8 مع عرض الشاشة المباشر
+#  3. اكتشاف الإسعاف بـ HSV Color Detection
+#  4. اكتشاف مخالفات الإشارة الحمراء عند تخطي الخطوط الظاهرية
+#  5. إرسال النتيجة للـ ESP32 Main كل 2 ثانية + مزامنة الحالة
 #
-#  ── IPs ────────────────────────────────────────────────────
-#  ESP32-CAM 1 : 192.168.137.101:81/stream
-#  ESP32-CAM 2 : 192.168.137.102:81/stream
-#  ESP32 Main  : 192.168.137.100/update
+#  ── الفيتشرز المضافة ────────────────────────────────────────
+#  6. تحسين الإضاءة المنخفضة تلقائياً (Low-Light CLAHE)
+#  7. كشف السير عكس الاتجاه (Wrong-Way Driving Detection)
+#  8. كشف التوقف المفاجئ والحوادث (Stalled / Accident Detection)
+#  9. كشف المشاة في منطقة العبور (Pedestrian Crosswalk Alert)
 # ============================================================
 
 import os
@@ -33,7 +34,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _START_TIME = time.time()  # وقت بداية النظام للـ time counter
 
 # ============================================================
-#  ⚙️ الإعدادات
+#  ⚙️ الإعدادات الأساسية
 # ============================================================
 CAM1_URL  = "http://192.168.137.101:81/stream"  # ← port 81
 CAM2_URL  = "http://192.168.137.102:81/stream"  # ← port 81
@@ -53,30 +54,64 @@ RED_UPPER2  = np.array([180, 255, 255], dtype=np.uint8)
 
 RED_THRESHOLD = 0.40  # 40% من الـ bounding box لازم يكون أحمر
 
+PERSON_CLASS_ID = 0
 VEHICLE_CLASSES = {2, 3, 5, 7}  # car, motorcycle, bus, truck
+DETECT_CLASSES  = {PERSON_CLASS_ID} | VEHICLE_CLASSES
 
-# confidence منخفض عشان truck وmotorcycle ميتفوتوش
-YOLO_CONF_THRESHOLD = 0.25  # الافتراضي 0.25 — قللّه لـ 0.15 لو لسه بيفوت
-YOLO_IMGSZ          = 640   # دقة معالجة الصور لـ YOLO (640 أو 320 للسرعة القصوى)
+YOLO_CONF_THRESHOLD = 0.25
+YOLO_IMGSZ          = 640
 
 # ── إعدادات المخالفات والخطوط الظاهرية ──────────────────────
 BASE_RESOLUTION = (1920, 1080)
+STOP_LINE_BUFFER = 120
 
-# مسافة الأمان للكشف (بالبكسل، بالنسبة لدقة 1080p).
-# أي سيارة تقترب من الخط بمسافة أقل من هذه القيمة سيتم التقاطها فوراً كمخالفة
-STOP_LINE_BUFFER = 120  # 120 بكسل على شاشة 1080p (حوالي 6% من العرض)
-
-# إحداثيات الخطوط الظاهرية لكل حارة (البداية والنهاية)
 LANE_LINES = {
     1: {"start": (566, 396), "end": (181, 487)},
     2: {"start": (1345, 465), "end": (1004, 548)}
 }
 
-# المجلد الذي سيتم حفظ المخالفات فيه
 VIOLATIONS_DIR = "dataset/violations"
-
-# التأكد من وجود مجلد المخالفات
+EVENTS_DIR     = "dataset/events"
 os.makedirs(VIOLATIONS_DIR, exist_ok=True)
+os.makedirs(EVENTS_DIR, exist_ok=True)
+
+# ============================================================
+#   إعدادات الفيتشرز الجديدة (قابلة للتعديل حسب التجربة)
+# ============================================================
+
+# 1) Low-Light Enhancement (CLAHE)
+ENABLE_LOW_LIGHT_ENHANCEMENT = True
+LOW_LIGHT_BRIGHTNESS_THRESH  = 65.0     # لو متوسط الإضاءة أقل من القيمة دي يفعّل CLAHE
+CLAHE_CLIP_LIMIT             = 2.5
+CLAHE_TILE_GRID_SIZE         = (8, 8)
+
+# 2) Wrong-Way Driving Detection
+ENABLE_WRONG_WAY_DETECTION   = True
+WRONG_WAY_MIN_DIST_1080P     = 90.0     # أقل مسافة حركة (على 1080p) قبل الحكم على الاتجاه
+WRONG_WAY_COS_THRESHOLD      = -0.45    # أقل من -0.45 يعني ماشي عكس الاتجاه بوضوح
+# متجه الاتجاه الصحيح لكل حارة (منسوب لـ 1080p) — هنعدله لسه حسب اتجاه الحركة في الكاميرا
+LANE_FLOW_VECTORS = {
+    1: (-1.0, 0.30),
+    2: (-1.0, 0.25),
+}
+
+# 3) Stalled Vehicle & Accident Detection
+ENABLE_STALLED_DETECTION     = True
+STALL_SECONDS                = 8.0      # ثواني الثبات لاعتبار المركبة متوقفة/عطلانة
+STALL_MOVE_THRESH_1080P      = 18.0     # مسافة حركة صغيرة جداً (بالبكسل على 1080p)
+
+ENABLE_ACCIDENT_DETECTION    = True
+ACCIDENT_IOU_THRESHOLD       = 0.22     # نسبة تداخل مربعي مركبتين للشك في حادثة
+ACCIDENT_CONFIRM_SECONDS     = 2.0      # مدة استمرار التداخل لتأكيد التنبيه
+
+# 4) Pedestrian Crosswalk Alert
+ENABLE_CROSSWALK_ALERT       = True
+ALERT_ONLY_ON_GREEN_LANES    = True     # تنبيه عند وجود مشاة في منطقة العبور لما الاشاره تكون اخضر
+# مضلعات مناطق عبور المشاة لكل حارة (مؤقتة على 1080p — هنعدلها حسب مكان العبور)
+CROSSWALK_ZONES = {
+    1: [(160, 495), (580, 410), (620, 470), (200, 565)],
+    2: [(980, 555), (1370, 475), (1410, 540), (1020, 625)],
+}
 
 
 # ============================================================
@@ -99,7 +134,7 @@ class LaneData:
     self.vehicle_count   = 0
     self.ambulance_found = False
     self.cam_connected   = False
-    self.green_remaining = 0   # ← التايمر من ESP32
+    self.green_remaining = 0
     self.annotated_frame = None
     self._lock           = threading.Lock()
 
@@ -122,6 +157,31 @@ class LaneData:
   def get_frame(self):
     with self._lock:
       return self.annotated_frame
+
+
+# ============================================================
+#  Feature 1: Low-Light Enhancement (CLAHE)
+# ============================================================
+def enhance_low_light(frame: np.ndarray) -> tuple:
+  """
+  يفحص متوسط سطوع الفريم؛ إذا كان منخفضاً يطبق CLAHE على قناة L في LAB.
+  يرجع: (processed_frame, was_enhanced, mean_brightness)
+  """
+  gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+  mean_brightness = float(np.mean(gray))
+
+  if not ENABLE_LOW_LIGHT_ENHANCEMENT or mean_brightness >= LOW_LIGHT_BRIGHTNESS_THRESH:
+    return frame, False, mean_brightness
+
+  lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+  l_channel, a_channel, b_channel = cv2.split(lab)
+
+  clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
+  enhanced_l = clahe.apply(l_channel)
+
+  merged_lab = cv2.merge((enhanced_l, a_channel, b_channel))
+  enhanced_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
+  return enhanced_bgr, True, mean_brightness
 
 
 # ============================================================
@@ -153,16 +213,13 @@ def detect_ambulance(frame: np.ndarray, box) -> bool:
 
 
 # ============================================================
-#  أداة معايرة الخطوط الظاهرية بالضغط بالماوس (Visual Calibration Tool)
+#  أداة معايرة الخطوط الظاهرية بالضغط بالماوس
 # ============================================================
 calibration_clicks = {1: [], 2: []}
 
 def make_mouse_callback(lane_id, frame_w, frame_h):
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            # The click x, y are already in native frame coordinates.
-            # We scale them to the BASE_RESOLUTION (1920, 1080) for printing and saving,
-            # so they remain resolution-independent.
             base_w, base_h = BASE_RESOLUTION
             scaled_x = int(x * base_w / frame_w)
             scaled_y = int(y * base_h / frame_h)
@@ -174,29 +231,25 @@ def make_mouse_callback(lane_id, frame_w, frame_h):
                 pt1, pt2 = calibration_clicks[lane_id][0], calibration_clicks[lane_id][1]
                 log.info("=" * 60)
                 log.info(f"🎉 تم معايرة خط حارة {lane_id} بنجاح!")
-                log.info(f"انسخ هذا السطر واستبدله في إعدادات LANE_LINES في كود python.py:")
+                log.info(f"انسخ هذا السطر واستبدله في إعدادات LANE_LINES في كود main.py:")
                 log.info(f"    {lane_id}: {{\"start\": {pt1}, \"end\": {pt2}}}")
                 log.info("=" * 60)
                 
-                # Apply line immediately in memory
                 LANE_LINES[lane_id] = {"start": pt1, "end": pt2}
                 calibration_clicks[lane_id] = []
     return mouse_callback
 
 
 # ============================================================
-#  رياضيات اكتشاف عبور الخطوط الثنائية (Line Crossing Math)
+#  رياضيات اكتشاف عبور الخطوط والأشكال الهندسية
 # ============================================================
 def ccw(A, B, C):
-    """التحقق من الترتيب الدائري عكس عقارب الساعة للنقاط A, B, C"""
     return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
 
 def check_intersection(A, B, C, D):
-    """التحقق مما إذا كان قطعة الخط AB تتقاطع مع قطعة الخط CD"""
     return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
 
 def point_to_segment_distance(P, A, B):
-    """حساب المسافة العمودية بين نقطة P وقطعة مستقيمة AB"""
     ab_x = B[0] - A[0]
     ab_y = B[1] - A[1]
     ap_x = P[0] - A[0]
@@ -215,21 +268,17 @@ def point_to_segment_distance(P, A, B):
     return np.hypot(P[0] - closest_x, P[1] - closest_y)
 
 def check_box_line_intersection(bbox, line_start, line_end):
-    """التحقق مما إذا كان مربع السيارة يتقاطع مع الخط الظاهري بأي شكل"""
     x1, y1, x2, y2 = bbox
-    # الحواف الأربعة للمربع المحيط بالسيارة
     edges = [
-        ((x1, y1), (x2, y1)), # الحافة العلوية
-        ((x1, y2), (x2, y2)), # الحافة السفلية
-        ((x1, y1), (x1, y2)), # الحافة اليسرى
-        ((x2, y1), (x2, y2))  # الحافة اليمنى
+        ((x1, y1), (x2, y1)),
+        ((x1, y2), (x2, y2)),
+        ((x1, y1), (x1, y2)),
+        ((x2, y1), (x2, y2))
     ]
-    # التحقق من تقاطع خط الوقوف مع أي من الحواف الأربعة
     for edge_start, edge_end in edges:
         if check_intersection(line_start, line_end, edge_start, edge_end):
             return True
             
-    # التحقق مما إذا كان خط الوقوف بالكامل يقع داخل المربع (حالة نادرة ولكن ممكنة)
     if (x1 <= line_start[0] <= x2 and y1 <= line_start[1] <= y2) or \
        (x1 <= line_end[0] <= x2 and y1 <= line_end[1] <= y2):
         return True
@@ -237,7 +286,6 @@ def check_box_line_intersection(bbox, line_start, line_end):
     return False
 
 def scale_coordinates(start_pt, end_pt, current_res):
-    """تعديل إحداثيات الخط الظاهري لتتوافق مع دقة إطار الفيديو الفعلي"""
     base_w, base_h = BASE_RESOLUTION
     curr_w, curr_h = current_res
     
@@ -252,30 +300,47 @@ def scale_coordinates(start_pt, end_pt, current_res):
     
     return scaled_start, scaled_end
 
+def scale_polygon(points, current_res):
+    base_w, base_h = BASE_RESOLUTION
+    curr_w, curr_h = current_res
+    scale_x = curr_w / base_w
+    scale_y = curr_h / base_h
+    return np.array([(int(px * scale_x), int(py * scale_y)) for (px, py) in points], dtype=np.int32)
+
+def compute_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter_w = max(0, xB - xA)
+    inter_h = max(0, yB - yA)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    areaA = max(1, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+    areaB = max(1, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+    return inter_area / float(areaA + areaB - inter_area)
+
 
 # ============================================================
-#  حفظ وإلتقاط لقطة المخالفة (Capture Violation)
+#  حفظ لقطات المخالفات والأحداث
 # ============================================================
 def trigger_violation(frame: np.ndarray, bbox, track_id: int, lane_id: int):
-    """يقوم بحفظ لقطة كاملة للمخالفة وقص صورة السيارة المخالفة في مجلد dataset/violations/"""
     x1, y1, x2, y2 = bbox
     h, w = frame.shape[:2]
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     filename_base = f"lane{lane_id}_violation_{timestamp}"
     
-    # رسم مربع أحمر للمخالفة على الصورة المحفوظة
     saved_frame = frame.copy()
     cv2.rectangle(saved_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-    cv2.putText(saved_frame, f"VIOLATION ID: {track_id}", (x1, y1 - 15), 
+    cv2.putText(saved_frame, f"VIOLATION ID: {track_id}", (x1, max(25, y1 - 15)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
     
-    # حفظ الإطار الكامل كإثبات
     full_path = os.path.join(VIOLATIONS_DIR, f"{filename_base}.jpg")
     cv2.imwrite(full_path, saved_frame)
     log.info(f"[VIOLATION] Lane {lane_id} - Saved violation proof: {full_path}")
     
-    # قص وحفظ السيارة المخالفة بشكل منفصل
     y1_c, y2_c = max(0, y1), min(h, y2)
     x1_c, x2_c = max(0, x1), min(w, x2)
     
@@ -285,24 +350,205 @@ def trigger_violation(frame: np.ndarray, bbox, track_id: int, lane_id: int):
         cv2.imwrite(crop_path, crop)
         log.info(f"[VIOLATION] Lane {lane_id} - Saved vehicle crop: {crop_path}")
 
+def save_event_snapshot(frame: np.ndarray, bbox, label: str, lane_id: int):
+    x1, y1, x2, y2 = bbox
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    fname = f"lane{lane_id}_{label.lower().replace(' ', '_')}_{timestamp}.jpg"
+    snap = frame.copy()
+    cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 140, 255), 3)
+    cv2.putText(snap, f"{label} (Lane {lane_id})", (x1, max(25, y1 - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2)
+    out_path = os.path.join(EVENTS_DIR, fname)
+    cv2.imwrite(out_path, snap)
+    log.info(f"[EVENT] Lane {lane_id} - Saved {label}: {out_path}")
+
 
 # ============================================================
-#  process_frame() — YOLOv8 Tracking + Violation + Ambulance + Overlay
+#  Feature 2: Wrong-Way Driving Detection
 # ============================================================
-# قواميس التتبع المشتركة بين الفريمات
+origin_positions = {1: {}, 2: {}}
+wrong_way_ids      = {1: set(), 2: set()}
+
+def check_wrong_way(lane_id: int, track_id: int, current_pos: tuple, frame_w: int, frame: np.ndarray, bbox) -> bool:
+  if not ENABLE_WRONG_WAY_DETECTION:
+    return False
+
+  if track_id not in origin_positions[lane_id]:
+    origin_positions[lane_id][track_id] = current_pos
+    return False
+
+  ox, oy = origin_positions[lane_id][track_id]
+  cx, cy = current_pos
+  dx = float(cx - ox)
+  dy = float(cy - oy)
+  dist = float(np.hypot(dx, dy))
+
+  min_dist = WRONG_WAY_MIN_DIST_1080P * (frame_w / BASE_RESOLUTION[0])
+  if dist < min_dist:
+    return False
+
+  flow_x, flow_y = LANE_FLOW_VECTORS.get(lane_id, (-1.0, 0.0))
+  flow_norm = float(np.hypot(flow_x, flow_y))
+  if flow_norm == 0:
+    return False
+
+  # Cosine similarity بين متجه حركة المركبة ومتجه الحارة الصحيح
+  cos_sim = (dx * flow_x + dy * flow_y) / (dist * flow_norm)
+
+  if cos_sim < WRONG_WAY_COS_THRESHOLD:
+    if track_id not in wrong_way_ids[lane_id]:
+      wrong_way_ids[lane_id].add(track_id)
+      log.warning(f"[WRONG WAY] Lane {lane_id} - Track ID {track_id} moving opposite to flow (cos={cos_sim:.2f})")
+      save_event_snapshot(frame, bbox, f"WRONG_WAY_ID_{track_id}", lane_id)
+    return True
+
+  return track_id in wrong_way_ids[lane_id]
+
+
+# ============================================================
+#  Feature 3: Stalled Vehicle & Accident Detection
+# ============================================================
+# لكل track_id: {"anchor": (x, y), "last_move_t": float, "stalled": bool, "saved": bool}
+stall_tracker = {1: {}, 2: {}}
+# لتتبع أزواج المركبات المتداخلة: {(id1, id2): first_overlap_t}
+overlap_pairs   = {1: {}, 2: {}}
+accident_saved  = {1: set(), 2: set()}
+
+def update_stalled_and_accidents(lane_id: int, vehicles_info: list, now: float, frame_w: int, frame: np.ndarray):
+  """
+  vehicles_info: قائمة من tuples بالشكل (track_id, bbox_int, bottom_center)
+  ترجع: (stalled_ids_set, accident_boxes_list)
+  """
+  stalled_ids = set()
+  accident_boxes = []
+
+  move_thresh = STALL_MOVE_THRESH_1080P * (frame_w / BASE_RESOLUTION[0])
+  active_ids = set()
+
+  for tid, bbox, center in vehicles_info:
+    active_ids.add(tid)
+    if tid not in stall_tracker[lane_id]:
+      stall_tracker[lane_id][tid] = {
+          "anchor": center,
+          "last_move_t": now,
+          "stalled": False,
+          "saved": False,
+      }
+      continue
+
+    entry = stall_tracker[lane_id][tid]
+    ax, ay = entry["anchor"]
+    moved_dist = float(np.hypot(center[0] - ax, center[1] - ay))
+
+    if moved_dist > move_thresh:
+      entry["anchor"] = center
+      entry["last_move_t"] = now
+      entry["stalled"] = False
+    else:
+      if ENABLE_STALLED_DETECTION and (now - entry["last_move_t"] >= STALL_SECONDS):
+        entry["stalled"] = True
+        stalled_ids.add(tid)
+        if not entry["saved"]:
+          entry["saved"] = True
+          log.warning(f"[STALLED] Lane {lane_id} - Vehicle ID {tid} stationary for >= {STALL_SECONDS}s")
+          save_event_snapshot(frame, bbox, f"STALLED_ID_{tid}", lane_id)
+
+  # تنظيف المركبات المختفية
+  for old_id in list(stall_tracker[lane_id].keys()):
+    if old_id not in active_ids:
+      stall_tracker[lane_id].pop(old_id, None)
+
+  # كشف التداخل المحتمل للحوادث بين المركبات
+  if ENABLE_ACCIDENT_DETECTION and len(vehicles_info) >= 2:
+    current_pairs = set()
+    n = len(vehicles_info)
+    for i in range(n):
+      for j in range(i + 1, n):
+        id1, box1, _ = vehicles_info[i]
+        id2, box2, _ = vehicles_info[j]
+        pair_key = (min(id1, id2), max(id1, id2))
+        iou = compute_iou(box1, box2)
+
+        if iou >= ACCIDENT_IOU_THRESHOLD:
+          current_pairs.add(pair_key)
+          if pair_key not in overlap_pairs[lane_id]:
+            overlap_pairs[lane_id][pair_key] = now
+          elif now - overlap_pairs[lane_id][pair_key] >= ACCIDENT_CONFIRM_SECONDS:
+            union_box = (
+                min(box1[0], box2[0]),
+                min(box1[1], box2[1]),
+                max(box1[2], box2[2]),
+                max(box1[3], box2[3]),
+            )
+            accident_boxes.append((union_box, pair_key))
+            if pair_key not in accident_saved[lane_id]:
+              accident_saved[lane_id].add(pair_key)
+              log.warning(f"[ACCIDENT] Lane {lane_id} - High overlap between IDs {pair_key} (IoU={iou:.2f})")
+              save_event_snapshot(frame, union_box, f"ACCIDENT_{pair_key[0]}_{pair_key[1]}", lane_id)
+
+    for p_key in list(overlap_pairs[lane_id].keys()):
+      if p_key not in current_pairs:
+        overlap_pairs[lane_id].pop(p_key, None)
+
+  return stalled_ids, accident_boxes
+
+
+# ============================================================
+#  Feature 4: Pedestrian Crosswalk Alert
+# ============================================================
+def check_pedestrians_on_crosswalk(lane_id: int, person_boxes: list, sig_state: str, frame_res: tuple, annotated_frame: np.ndarray) -> int:
+  """
+  person_boxes: قائمة من (x1, y1, x2, y2) للأشخاص المكتشفين
+  ترجع عدد المشاة الموجودين داخل منطقة العبور في هذه الحارة
+  """
+  if not ENABLE_CROSSWALK_ALERT or lane_id not in CROSSWALK_ZONES:
+    return 0
+
+  poly = scale_polygon(CROSSWALK_ZONES[lane_id], frame_res)
+  # رسم حدود منطقة العبور بشفافية خفيفة
+  zone_overlay = annotated_frame.copy()
+  cv2.polylines(zone_overlay, [poly], isClosed=True, color=(255, 200, 0), thickness=2)
+  cv2.fillPoly(zone_overlay, [poly], color=(255, 200, 0))
+  cv2.addWeighted(zone_overlay, 0.12, annotated_frame, 0.88, 0, annotated_frame)
+
+  pedestrians_in_zone = 0
+  for (px1, py1, px2, py2) in person_boxes:
+    foot_pt = (float((px1 + px2) / 2.0), float(py2))
+    inside = cv2.pointPolygonTest(poly, foot_pt, measureDist=False) >= 0
+    if inside:
+      pedestrians_in_zone += 1
+      cv2.rectangle(annotated_frame, (px1, py1), (px2, py2), (0, 215, 255), 2)
+      cv2.putText(annotated_frame, "PEDESTRIAN", (px1, max(20, py1 - 8)),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+
+  if pedestrians_in_zone > 0:
+    if not ALERT_ONLY_ON_GREEN_LANES or sig_state == "GREEN":
+      log.warning(f"[CROSSWALK] Lane {lane_id} - {pedestrians_in_zone} pedestrian(s) on crosswalk while signal is {sig_state}!")
+      return pedestrians_in_zone
+
+  return 0
+
+
+# ============================================================
+#  process_frame() — YOLOv8 Tracking + All Features + Overlay
+# ============================================================
 track_histories = {1: {}, 2: {}}
 violated_ids = {1: set(), 2: set()}
 violation_flash_timers = {1: 0, 2: 0}
 
 def process_frame(model: YOLO, frame: np.ndarray, lane_id: int, sig_state: str, sig_remaining: int) -> tuple:
-  # تشغيل التتبع لربط المركبات بمعرفات فريدة (persist=True)
-  # نمرر الـ device والـ imgsz والـ half لتسريع الفريمات واستغلال كرت الشاشة بالـ FP16
+  now = time.time()
+  h, w = frame.shape[:2]
+
+  # 1) تحسين الإضاءة المنخفضة تلقائياً قبل الكشف
+  enhanced_frame, low_light_applied, brightness_val = enhance_low_light(frame)
+
   use_half = (DEVICE == "cuda")
   results = model.track(
-      source=frame,
+      source=enhanced_frame,
       conf=YOLO_CONF_THRESHOLD,
       persist=True,
-      classes=list(VEHICLE_CLASSES),
+      classes=list(DETECT_CLASSES),
       verbose=False,
       device=DEVICE,
       imgsz=YOLO_IMGSZ,
@@ -311,13 +557,9 @@ def process_frame(model: YOLO, frame: np.ndarray, lane_id: int, sig_state: str, 
 
   vehicle_count   = 0
   ambulance_found = False
-  
-  # الحصول على الصورة المرسومة من YOLO كقاعدة أساسية
   annotated_frame = results.plot()
 
-  h, w = frame.shape[:2]
-
-  # 1. إحضار ورسم الخطوط الظاهرية بناءً على حالة الإشارة
+  # رسم خط الوقوف الظاهري
   line_config = LANE_LINES[lane_id]
   line_start, line_end = scale_coordinates(line_config["start"], line_config["end"], (w, h))
   
@@ -328,72 +570,95 @@ def process_frame(model: YOLO, frame: np.ndarray, lane_id: int, sig_state: str, 
   }
   sig_color = color_map.get(sig_state, (200, 200, 200))
   
-  # رسم خط الوقوف الظاهري
   cv2.line(annotated_frame, line_start, line_end, sig_color, 4)
-  cv2.putText(annotated_frame, f"LANE {lane_id} STOP LINE", 
-              (min(line_start[0], line_end[0]), min(line_start[1], line_end[1]) - 15), 
+  cv2.putText(annotated_frame, f"LANE {lane_id} STOP LINE",
+              (min(line_start[0], line_end[0]), min(line_start[1], line_end[1]) - 15),
               cv2.FONT_HERSHEY_SIMPLEX, 0.65, sig_color, 2)
 
   current_frame_ids = set()
+  vehicles_info = []
+  person_boxes = []
+  wrong_way_count = 0
 
   if results.boxes is not None:
     for box in results.boxes:
-      if int(box.cls[0]) not in VEHICLE_CLASSES:
+      cls_id = int(box.cls[0])
+      xyxy = box.xyxy[0].cpu().numpy().astype(int)
+      x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
+
+      if cls_id == PERSON_CLASS_ID:
+        person_boxes.append((x1, y1, x2, y2))
+        continue
+
+      if cls_id not in VEHICLE_CLASSES:
         continue
       
       vehicle_count += 1
       
       # كشف الإسعاف عبر اللون الأحمر
-      if detect_ambulance(frame, box):
+      if detect_ambulance(enhanced_frame, box):
         ambulance_found = True
 
-      # كشف تتبع عبور خط الإشارة الحمراء
       if box.id is not None:
         track_id = int(box.id[0].item())
         current_frame_ids.add(track_id)
         
-        xyxy = box.xyxy[0].cpu().numpy().astype(int) # [x1, y1, x2, y2]
-        bottom_edge_start = (xyxy[0], xyxy[3])
-        bottom_edge_end = (xyxy[2], xyxy[3])
-        bottom_center = (int((xyxy[0] + xyxy[2]) / 2), xyxy[3])
+        bottom_edge_start = (x1, y2)
+        bottom_edge_end = (x2, y2)
+        bottom_center = (int((x1 + x2) / 2), y2)
+        vehicles_info.append((track_id, (x1, y1, x2, y2), bottom_center))
         
-        # رسم دائرة صغيرة أسفل كل سيارة كدليل للتتبع
         cv2.circle(annotated_frame, bottom_center, 5, (0, 165, 255), -1)
 
-        # التحقق من المخالفة فقط إذا كانت إشارة هذه الحارة حمراء
+        # فحص السير عكس الاتجاه
+        if check_wrong_way(lane_id, track_id, bottom_center, w, enhanced_frame, (x1, y1, x2, y2)):
+          wrong_way_count += 1
+          cv2.putText(annotated_frame, f"WRONG WAY #{track_id}", (x1, max(20, y1 - 35)),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # التحقق من مخالفة الإشارة الحمراء
         if sig_state == "RED":
-            # 1. التقاطع المباشر للحافة السفلية للسيارة مع الخط
             edge_intersects = check_intersection(line_start, line_end, bottom_edge_start, bottom_edge_end)
             
-            # 2. تقاطع مسار حركة السيارة من الفريم السابق للفريم الحالي
             trajectory_intersects = False
             if track_id in track_histories[lane_id]:
                 prev_center = track_histories[lane_id][track_id]
                 trajectory_intersects = check_intersection(line_start, line_end, prev_center, bottom_center)
                 
-            # 3. تقاطع المربع المحيط بالسيارة بالكامل مع خط الوقوف (الحساسية ثلاثية الأبعاد)
-            box_intersects = check_box_line_intersection(xyxy, line_start, line_end)
+            box_intersects = check_box_line_intersection((x1, y1, x2, y2), line_start, line_end)
             
-            # 4. مسافة الأمان للاقتراب (Buffer check)
             scaled_buffer = STOP_LINE_BUFFER * (w / BASE_RESOLUTION[0])
             dist_to_line = point_to_segment_distance(bottom_center, line_start, line_end)
             is_close = dist_to_line <= scaled_buffer
             
-            # في حال حدوث تقاطع أو اقتراب من مسافة الأمان لأول مرة لهذه السيارة
             if (edge_intersects or trajectory_intersects or box_intersects or is_close) and (track_id not in violated_ids[lane_id]):
                 violated_ids[lane_id].add(track_id)
-                violation_flash_timers[lane_id] = 15  # تفعيل الفلاش التحذيري لـ 15 فريم
-                
-                # حفظ اللقطة والقص في المجلد
-                trigger_violation(frame, xyxy, track_id, lane_id)
+                violation_flash_timers[lane_id] = 15
+                trigger_violation(enhanced_frame, (x1, y1, x2, y2), track_id, lane_id)
 
-        # حفظ مركز الحركة لتتبعه في الفريم القادم
         track_histories[lane_id][track_id] = bottom_center
+
+  # تحديث التوقف المفاجئ والحوادث
+  stalled_ids, accident_boxes = update_stalled_and_accidents(lane_id, vehicles_info, now, w, enhanced_frame)
+
+  for tid, bbox, _ in vehicles_info:
+    if tid in stalled_ids:
+      bx1, by1, bx2, by2 = bbox
+      cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0, 140, 255), 3)
+      cv2.putText(annotated_frame, f"STALLED #{tid}", (bx1, max(20, by1 - 10)),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+
+  for (ux1, uy1, ux2, uy2), _ in accident_boxes:
+    cv2.rectangle(annotated_frame, (ux1, uy1), (ux2, uy2), (0, 0, 255), 3)
+
+  # تحديث تنبيه المشاة على ممر العبور
+  pedestrians_alert_count = check_pedestrians_on_crosswalk(lane_id, person_boxes, sig_state, (w, h), annotated_frame)
 
   # تنظيف الذاكرة للمركبات التي غادرت الكاميرا
   for old_id in list(track_histories[lane_id].keys()):
       if old_id not in current_frame_ids:
           track_histories[lane_id].pop(old_id, None)
+          origin_positions[lane_id].pop(old_id, None)
 
   # فلاش تحذيري للمخالفة على الشاشة
   if violation_flash_timers[lane_id] > 0:
@@ -401,38 +666,55 @@ def process_frame(model: YOLO, frame: np.ndarray, lane_id: int, sig_state: str, 
       overlay = annotated_frame.copy()
       cv2.rectangle(overlay, (0, 0), (w, 120), (0, 0, 255), -1)
       cv2.addWeighted(overlay, 0.35, annotated_frame, 0.65, 0, annotated_frame)
-      cv2.putText(annotated_frame, "!!! RED LIGHT VIOLATION !!!", (w // 2 - 250, 75),
+      cv2.putText(annotated_frame, "!!! RED LIGHT VIOLATION !!!", (max(20, w // 2 - 250), 75),
                   cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3)
+
+  # شريط تنبيهات الفيتشرز الجديدة أعلى يسار الشاشة
+  alerts = []
+  if len(accident_boxes) > 0:
+    alerts.append(f"ACCIDENT ({len(accident_boxes)})")
+  if len(stalled_ids) > 0:
+    alerts.append(f"STALLED ({len(stalled_ids)})")
+  if wrong_way_count > 0:
+    alerts.append(f"WRONG WAY ({wrong_way_count})")
+  if pedestrians_alert_count > 0:
+    alerts.append(f"PEDESTRIAN ({pedestrians_alert_count})")
+
+  if alerts:
+    alert_text = " | ".join(alerts)
+    cv2.rectangle(annotated_frame, (10, 10), (min(w - 10, 10 + len(alert_text) * 12 + 20), 46), (0, 0, 180), -1)
+    cv2.putText(annotated_frame, alert_text, (20, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
   # ── التايمر والمعلومات على الشاشة ───────────────────────────
   elapsed_total = int(time.time() - _START_TIME)
   mins  = elapsed_total // 60
   secs  = elapsed_total % 60
 
-  # خلفية شفافة لعلبة البيانات
+  box_w = 195
   overlay = annotated_frame.copy()
-  cv2.rectangle(overlay, (w-175, 8), (w-8, 90), (0, 0, 0), -1)
+  cv2.rectangle(overlay, (w - box_w - 8, 8), (w - 8, 108), (0, 0, 0), -1)
   cv2.addWeighted(overlay, 0.55, annotated_frame, 0.45, 0, annotated_frame)
 
-  # السطر الأول — state + عداد تنازلي
   timer_text = f"{sig_state}  {sig_remaining}s" if sig_remaining > 0 else sig_state
   cv2.putText(annotated_frame, timer_text,
-    (w-168, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.65, sig_color, 2)
+    (w - box_w, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.65, sig_color, 2)
 
-  # السطر التاني — عدد العربيات
   cv2.putText(annotated_frame, f"Vehicles: {vehicle_count}",
-    (w-168, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    (w - box_w, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-  # السطر التالت — عداد تصاعدي من أول ما النظام اشتغل
-  cv2.putText(annotated_frame, f"Time: {mins:02d}:{secs:02d}",
-    (w-168, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-  # ────────────────────────────────────────────────────────────
+  ll_tag = f"CLAHE({brightness_val:.0f})" if low_light_applied else f"LUX:{brightness_val:.0f}"
+  cv2.putText(annotated_frame, f"Time: {mins:02d}:{secs:02d} | {ll_tag}",
+    (w - box_w, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 220, 180), 1)
+
+  cv2.putText(annotated_frame, f"Cam{lane_id} | Q:Quit",
+    (w - box_w, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
   return vehicle_count, ambulance_found, annotated_frame
 
 
 # ============================================================
-#  FreshFrameReader — خيط مستقل لقراءة أحدث فريم وتجنب تأخير البث التراكمي
+#  FreshFrameReader
 # ============================================================
 class FreshFrameReader:
   def __init__(self, url: str, lane_id: int):
@@ -469,7 +751,6 @@ class FreshFrameReader:
         self.cap = None
         time.sleep(1.0)
       
-      # نوم بسيط جداً لمنع استهلاك 100% من المعالج عند قراءة الفريمات
       time.sleep(0.001)
 
   def get_frame(self) -> tuple:
@@ -486,7 +767,7 @@ class FreshFrameReader:
 
 
 # ============================================================
-#  camera_thread() — Thread مستقل لكل كاميرا مع Reconnect ومحاكاة
+#  camera_thread()
 # ============================================================
 def camera_thread(
   lane:          LaneData,
@@ -497,7 +778,6 @@ def camera_thread(
 ):
   log.info(f"[CAM{lane.lane_id}] Thread started → {cam_url}")
   
-  # التحقق مما إذا كان العنوان بثاً حياً أو ملف فيديو محلياً
   is_live = cam_url.startswith("http://") or cam_url.startswith("https://") or cam_url.startswith("rtsp://")
   
   reader = None
@@ -517,7 +797,6 @@ def camera_thread(
     if is_live and not using_fallback:
       ret, frame = reader.get_frame()
       if not ret:
-        # إذا انقطع البث المباشر، تحقق مما إذا كان هناك فيديو محلي كفولباك
         if os.path.exists(local_fallback_file):
           log.info(f"[CAM{lane.lane_id}] Live stream offline. Falling back to local video: {local_fallback_file}")
           if reader:
@@ -527,14 +806,12 @@ def camera_thread(
           using_fallback = True
           is_live = False
         else:
-          # إذا لم يكن هناك بديل محلي، حدّث الحالة لغير متصل وانتظر
           lane.update(count=0, ambulance=False, connected=False)
           time.sleep(1.0)
           continue
     else:
-      # القراءة من ملف محلي (إما الملف الأصلي أو الفولباك)
+      target_file = local_fallback_file if using_fallback else cam_url
       if cap_local is None or not cap_local.isOpened():
-        target_file = local_fallback_file if using_fallback else cam_url
         cap_local = cv2.VideoCapture(target_file)
         if not cap_local.isOpened():
           log.error(f"[CAM{lane.lane_id}] Cannot open file: {target_file}")
@@ -544,31 +821,25 @@ def camera_thread(
           
       ret, frame = cap_local.read()
       if not ret or frame is None:
-        # إعادة تشغيل الفيديو المحلي للاستمرار بالاستعراض
         cap_local.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = cap_local.read()
         if not ret or frame is None:
           time.sleep(1.0)
           continue
       
-      # تأخير صغير لمحاكاة معدل إطارات طبيعي (~30 FPS) عند قراءة الملف المحلي
       time.sleep(0.03)
 
-    # تشغيل المعالجة والـ YOLO
     try:
       s1, r1, s2, r2 = traffic_timer.get_display()
       sig_state     = s1 if lane.lane_id == 1 else s2
       sig_remaining = r1 if lane.lane_id == 1 else r2
       count, ambulance, annotated_frame = process_frame(model, frame, lane.lane_id, sig_state, sig_remaining)
-      
-      # تحديث البيانات وإرسال الفريم الموشر لعرضه لاحقاً في خيط الواجهة الرئيسي (thread-safe)
       lane.update(count=count, ambulance=ambulance, connected=True, frame=annotated_frame)
       
     except Exception as e:
       log.error(f"[CAM{lane.lane_id}] YOLO error: {e}")
       lane.update(count=0, ambulance=False, connected=True)
 
-  # تنظيف الموارد عند الإغلاق
   if reader:
     reader.release()
   if cap_local:
@@ -577,7 +848,7 @@ def camera_thread(
 
 
 # ============================================================
-#  SoundState — حالة سنسور الصوت (من ESP32 /status)
+#  SoundState & Network Diagnostics
 # ============================================================
 class SoundState:
   def __init__(self):
@@ -592,12 +863,7 @@ class SoundState:
     with self._lock:
       return self._active
 
-
-# ============================================================
-#  أداة اختبار الاتصال بالشبكة (Network Socket Check)
-# ============================================================
 def check_device_connection(ip, port, timeout=1.0):
-    """التحقق السريع من وصول الشبكة للجهاز عبر الـ Sockets دون صلاحيات الأدمن"""
     try:
         s = socket.create_connection((ip, port), timeout=timeout)
         s.close()
@@ -606,16 +872,15 @@ def check_device_connection(ip, port, timeout=1.0):
         return False
 
 def run_startup_diagnostics():
-    """أداة التشخيص الأولى لفحص اتصال الكاميرات والمتحكم"""
     log.info("=" * 60)
     log.info("  ⚡ تشخيص شبكة الاتصال اللاسلكية (Startup Diagnostics) ⚡")
     log.info("=" * 60)
     
-    esp_ip = "192.168.137.100"
+    esp_ip  = "192.168.137.100"
     cam1_ip = "192.168.137.101"
     cam2_ip = "192.168.137.102"
     
-    esp_ok = check_device_connection(esp_ip, 80, timeout=1.5)
+    esp_ok  = check_device_connection(esp_ip, 80, timeout=1.5)
     cam1_ok = check_device_connection(cam1_ip, 81, timeout=1.5)
     cam2_ok = check_device_connection(cam2_ip, 81, timeout=1.5)
     
@@ -626,24 +891,23 @@ def run_startup_diagnostics():
     if not esp_ok or not cam1_ok or not cam2_ok:
         log.warning("=" * 60)
         log.warning("             ⚠️ إرشادات حل مشكلات الاتصال ⚠️")
-        log.warning("1. تأكد من أن جهاز الكمبيوتر متصل بنقطة الواي فاي SSID: 'hani'")
-        log.warning("2. تأكد من تفعيل الهوتسبوت وتغذية الكاميرات والمتحكم بالطاقة الكافية.")
-        log.warning("3. تأكد من عدم وجود تضارب في العناوين الثابتة (Static IPs) مع أجهزة أخرى.")
-        log.warning("4. تأكد من تطابق الـ SSID والرقم السري في أكواد الـ Arduino المرفوعة للكاميرات.")
+        log.warning("1. تأكد من الاتصال بنقطة الواي فاي الصحيحة وتطابق الـ SSID/Password.")
+        log.warning("2. تأكد من تغذية الكاميرات والمتحكم بالطاقة الكافية.")
+        log.warning("3. في حال عدم وجود بث مباشر، سيتم الاعتماد على الفيديوهات المحلية (lane1.mp4 / lane2.mp4) أو المحاكاة.")
         log.warning("=" * 60)
     else:
         log.info("جميع الأجهزة متصلة بالشبكة وجاهزة للعمل بنجاح!\n")
 
 
 # ============================================================
-#  poll_esp32_sound() — Thread بيقرأ البيانات من خادم الـ ESP32
+#  poll_esp32_sound() & send_to_esp32()
 # ============================================================
 def poll_esp32_sound(
-  sound_state:  SoundState,
-  esp32_base:   str,
-  stop_event:   threading.Event,
-  lane1:        "LaneData",
-  lane2:        "LaneData",
+  sound_state:   SoundState,
+  esp32_base:    str,
+  stop_event:    threading.Event,
+  lane1:         "LaneData",
+  lane2:         "LaneData",
   traffic_timer: "TrafficTimer"
 ):
   status_url = esp32_base.replace("/update", "/status")
@@ -656,45 +920,38 @@ def poll_esp32_sound(
         data = resp.json()
         sound_state.set(data.get("sound_detected", False))
         
-        # مزامنة حالات الإشارات الحقيقية من خادم الـ ESP32 مع كود البايثون
         l1_state = data.get("lane1_state", "RED").upper()
         l2_state = data.get("lane2_state", "GREEN").upper()
         mode     = data.get("mode", "FALLBACK").upper()
         
         traffic_timer.sync_with_esp32(l1_state, l2_state, mode)
 
-        # دعم استقبال المتبقي من العداد إذا تم تفعيله على الهاردوير
         if "lane1_remaining" in data:
             lane1.set_timer(int(data.get("lane1_remaining", 0)))
         if "lane2_remaining" in data:
             lane2.set_timer(int(data.get("lane2_remaining", 0)))
       else:
-        # فحص تفصيلي للمخدم الذي استجاب بالـ 404
-        server_header = resp.headers.get("Server", "Unknown Server")
-        log.warning(f"[POLL ERROR] Status returned {resp.status_code} from {status_url}. Server Type: {server_header}")
         traffic_timer.set_offline()
-    except Exception as e:
-      # في حالة انقطاع الاتصال نتحول للمحاكاة المحلية تلقائياً
+    except Exception:
       traffic_timer.set_offline()
       
     time.sleep(1.0)
 
 
-# ============================================================
-#  send_to_esp32() — بيبعت البيانات للـ ESP32 كل SEND_INTERVAL
-# ============================================================
 def send_to_esp32(
-  lane1:        LaneData,
-  lane2:        LaneData,
-  sound_active: bool
+  lane1:         LaneData,
+  lane2:         LaneData,
+  sound_active:  bool,
+  traffic_timer: "TrafficTimer"
 ) -> bool:
   c1, amb1, _ = lane1.read()
   c2, amb2, _ = lane2.read()
 
+  traffic_timer.update_counts(c1, c2)
+
   ambulance_lane = 0
   emergency      = False
 
-  # Emergency = صوت صفارة + عربية حمراء في نفس الوقت
   if sound_active and (amb1 or amb2):
     emergency = True
     if amb1 and not amb2:
@@ -707,6 +964,8 @@ def send_to_esp32(
       ambulance_lane = 1 if c1 <= c2 else 2
       log.info(f"[EMERGENCY] Both lanes — priority Lane {ambulance_lane}")
 
+    traffic_timer.set_emergency(ambulance_lane)
+
   payload = {
     "lane1":          c1,
     "lane2":          c2,
@@ -717,61 +976,34 @@ def send_to_esp32(
   log.info(f"[POST] Sending payload to ESP32: {payload}")
 
   try:
-    resp = requests.post(
-      ESP32_URL,
-      json=payload,
-      timeout=5.0
-    )
-    if resp.status_code == 200:
-      return True
-    
-    # تفاصيل تشخيصية إذا كانت الإستجابة خاطئة (مثل 404)
-    server_header = resp.headers.get("Server", "Unknown Server")
-    log.error(f"[POST ERROR] ESP32 returned status {resp.status_code} at {ESP32_URL}. Server Type: {server_header}")
-    log.error(f"[POST ERROR] Response Body: {resp.text[:300]}")
-    return False
-
-  except requests.exceptions.ConnectionError:
-    # فحص ما إذا كان الـ ESP32 متصلاً بالشبكة أساساً
-    if not check_device_connection("192.168.137.100", 80, timeout=0.8):
-        log.error("[POST] Cannot reach ESP32 at 192.168.137.100 - Device is offline/unreachable")
-    else:
-        log.error("[POST] Connection failed - Web Server not running on ESP32 (Check Arduino Serial Monitor)")
-    return False
-
-  except requests.exceptions.Timeout:
-    log.error("[POST] ESP32 request timed out")
+    resp = requests.post(ESP32_URL, json=payload, timeout=5.0)
+    return resp.status_code == 200
+  except Exception:
     return False
 
 
 # ============================================================
-#  TrafficTimer — عداد الإشارة (أخضر/أصفر/أحمر) محسوب في Python
+#  TrafficTimer & timer_thread
 # ============================================================
-YELLOW_DURATION = 3   # ثواني الأصفر
+YELLOW_DURATION = 3
 
 class TrafficTimer:
-  """
-  بتحسب وقت الأخضر من عدد العربيات وبتعد تنازلياً تلقائياً.
-  الـ state بتتحدث كل ثانية في thread مستقل.
-  """
   def __init__(self):
-    self._lock        = threading.Lock()
-    self.active_lane  = 1          # اللين الشغال دلوقتي
-    self.state        = "GREEN"    # GREEN | YELLOW | RED
-    self.remaining    = 15         # الثواني المتبقية للـ state الحالي
-    self._green1      = 15         # الوقت المحسوب للحارة 1
-    self._green2      = 15         # الوقت المحسوب للحارة 2
+    self._lock           = threading.Lock()
+    self.active_lane     = 1
+    self.state           = "GREEN"
+    self.remaining       = 15
+    self._green1         = 15
+    self._green2         = 15
     self.esp32_connected = False
-    self.esp32_mode   = "FALLBACK"
+    self.esp32_mode      = "FALLBACK"
 
   def update_counts(self, c1: int, c2: int):
-    """بتحدث أوقات الأخضر بناءً على عدد العربيات — بس مش بتقطع الـ cycle الحالي"""
     with self._lock:
       self._green1 = max(5, min(60, c1 * 1 + 5))
       self._green2 = max(5, min(60, c2 * 1 + 5))
 
   def sync_with_esp32(self, l1_state: str, l2_state: str, mode: str):
-    """مزامنة مؤقت وحالات العرض المباشر مع الحالات الفيزيائية للـ ESP32 تلقائياً"""
     with self._lock:
       self.esp32_connected = True
       self.esp32_mode = mode
@@ -788,7 +1020,6 @@ class TrafficTimer:
       else:
         new_state = "RED"
         
-      # في حالة حدوث انتقال للحالة أو الحارة بشكل فيزيائي، نقوم بإعادة تهيئة التوقيت المتبقي محلياً للتوافق
       if new_active_lane != self.active_lane or new_state != self.state:
         self.active_lane = new_active_lane
         self.state = new_state
@@ -800,25 +1031,20 @@ class TrafficTimer:
           self.remaining = 0
 
   def set_offline(self):
-    """تفعيل وضع عدم الاتصال وتنشيط المحاكاة المحلية"""
     with self._lock:
       self.esp32_connected = False
 
   def tick(self):
-    """بتتنادى كل ثانية من thread مستقل لإنقاص العداد تنازلياً"""
     with self._lock:
-      # إذا كان الهاردوير متصلاً، الـ ESP32 هو من يقود الطور ولكننا نقوم بالعد التنازلي للشاشة
       if self.esp32_connected:
         if self.remaining > 0:
           self.remaining -= 1
         return
         
-      # محاكاة محلية كاملة في حال عدم الاتصال
       if self.remaining > 0:
         self.remaining -= 1
         return
 
-      # الـ remaining وصل صفر — انتقل للـ state الجاي محلياً
       if self.state == "GREEN":
         self.state     = "YELLOW"
         self.remaining = YELLOW_DURATION
@@ -831,165 +1057,94 @@ class TrafficTimer:
         self.remaining = self._green1 if self.active_lane == 1 else self._green2
 
   def set_emergency(self, amb_lane: int):
-    """Emergency mode — افتح اللين المطلوب 20 ثانية"""
     with self._lock:
-      self.active_lane = amb_lane
-      self.state       = "GREEN"
-      self.remaining   = 20
+      if amb_lane in (1, 2):
+        self.active_lane = amb_lane
+        self.state       = "GREEN"
+        self.remaining   = 20
 
   def get_display(self) -> tuple:
-    """بترجع (lane1_state, lane1_remaining, lane2_state, lane2_remaining)"""
     with self._lock:
       if self.active_lane == 1:
-        if self.state == "GREEN":
-          return ("GREEN",  self.remaining, "RED",    0)
-        elif self.state == "YELLOW":
-          return ("YELLOW", self.remaining, "RED",    0)
+        if self.state in ("GREEN", "YELLOW"):
+          return (self.state, self.remaining, "RED", 0)
       else:
-        if self.state == "GREEN":
-          return ("RED",    0, "GREEN",  self.remaining)
-        elif self.state == "YELLOW":
-          return ("RED",    0, "YELLOW", self.remaining)
+        if self.state in ("GREEN", "YELLOW"):
+          return ("RED", 0, self.state, self.remaining)
       return ("RED", 0, "RED", 0)
 
 
 def timer_thread(traffic_timer: TrafficTimer, stop_event: threading.Event):
-  """Thread بيعد كل ثانية"""
   while not stop_event.is_set():
     time.sleep(1.0)
     traffic_timer.tick()
 
 
 # ============================================================
-#  main()
+#  Main Loop & UI Display
 # ============================================================
 def main():
-  log.info("=" * 55)
-  log.info("  AI-Driven Smart Traffic Management System")
-  log.info("=" * 55)
-  
-  # تشغيل فحص تشخيص الشبكة المبدئي
   run_startup_diagnostics()
-  
-  log.info(f"[YOLO] Loading model instances for Lane 1 and Lane 2...")
-  model1 = YOLO(MODEL_PATH)
-  model2 = YOLO(MODEL_PATH)
-  log.info(f"[YOLO] PyTorch device detected: {DEVICE.upper()}")
-  if DEVICE == "cuda":
-    log.info(f"[YOLO] GPU Name: {torch.cuda.get_device_name(0)}")
-  else:
-    log.warning("[YOLO] RUNNING ON CPU! CUDA is not available. Please verify your PyTorch CUDA installation.")
-  log.info("[YOLO] Models loaded!\n")
 
-  lane1         = LaneData(lane_id=1)
-  lane2         = LaneData(lane_id=2)
-  sound_state   = SoundState()
+  log.info(f"[MODEL] Loading {MODEL_PATH} on {DEVICE}...")
+  model = YOLO(MODEL_PATH)
+
+  lane1 = LaneData(1)
+  lane2 = LaneData(2)
+  sound_state = SoundState()
   traffic_timer = TrafficTimer()
-  stop_event    = threading.Event()
+  stop_event = threading.Event()
 
-  t_cam1 = threading.Thread(
-    target=camera_thread,
-    args=(lane1, CAM1_URL, model1, stop_event, traffic_timer),
-    daemon=True, name="CAM1-Thread"
-  )
-  t_cam2 = threading.Thread(
-    target=camera_thread,
-    args=(lane2, CAM2_URL, model2, stop_event, traffic_timer),
-    daemon=True, name="CAM2-Thread"
-  )
-  t_sound = threading.Thread(
-    target=poll_esp32_sound,
-    args=(sound_state, ESP32_URL, stop_event, lane1, lane2, traffic_timer),
-    daemon=True, name="Sound-Thread"
-  )
-  t_timer = threading.Thread(
-    target=timer_thread,
-    args=(traffic_timer, stop_event),
-    daemon=True, name="Timer-Thread"
-  )
+  t_timer = threading.Thread(target=timer_thread, args=(traffic_timer, stop_event), daemon=True)
+  t_poll  = threading.Thread(target=poll_esp32_sound, args=(sound_state, ESP32_URL, stop_event, lane1, lane2, traffic_timer), daemon=True)
+  t_cam1  = threading.Thread(target=camera_thread, args=(lane1, CAM1_URL, model, stop_event, traffic_timer), daemon=True)
+  t_cam2  = threading.Thread(target=camera_thread, args=(lane2, CAM2_URL, model, stop_event, traffic_timer), daemon=True)
 
+  t_timer.start()
+  t_poll.start()
   t_cam1.start()
   t_cam2.start()
-  t_sound.start()
-  t_timer.start()
 
-  log.info("[SYS] All threads started")
-  log.info(f"[SYS] Sending to ESP32 every {SEND_INTERVAL}s")
-  log.info("[SYS] Press Ctrl+C or ESC in camera windows to stop\n")
+  win1 = "Lane 1 - Smart Traffic"
+  win2 = "Lane 2 - Smart Traffic"
+  cv2.namedWindow(win1, cv2.WINDOW_NORMAL)
+  cv2.namedWindow(win2, cv2.WINDOW_NORMAL)
 
-  last_post_time = 0
+  callbacks_bound = {1: False, 2: False}
+  last_send_time = 0.0
 
   try:
     while not stop_event.is_set():
-      # 1. عرض فريم حارة 1 في خيط الواجهة الرئيسي (Main Thread GUI)
-      f1 = lane1.get_frame()
-      if f1 is not None:
-        window1 = "Lane 1 - AI Traffic Monitor"
-        cv2.imshow(window1, f1)
-        if not hasattr(lane1, 'callback_registered'):
-          h, w = f1.shape[:2]
-          cv2.setMouseCallback(window1, make_mouse_callback(1, w, h))
-          lane1.callback_registered = True
+      now = time.time()
+      if now - last_send_time >= SEND_INTERVAL:
+        last_send_time = now
+        send_to_esp32(lane1, lane2, sound_state.get(), traffic_timer)
 
-      # 2. عرض فريم حارة 2 في خيط الواجهة الرئيسي (Main Thread GUI)
-      f2 = lane2.get_frame()
-      if f2 is not None:
-        window2 = "Lane 2 - AI Traffic Monitor"
-        cv2.imshow(window2, f2)
-        if not hasattr(lane2, 'callback_registered'):
-          h, w = f2.shape[:2]
-          cv2.setMouseCallback(window2, make_mouse_callback(2, w, h))
-          lane2.callback_registered = True
+      for lane_obj, win_name, lid in [(lane1, win1, 1), (lane2, win2, 2)]:
+        frame = lane_obj.get_frame()
+        if frame is not None:
+          fh, fw = frame.shape[:2]
+          if not callbacks_bound[lid]:
+            cv2.setMouseCallback(win_name, make_mouse_callback(lid, fw, fh))
+            callbacks_bound[lid] = True
+          cv2.imshow(win_name, frame)
 
-      # waitKey(1) مهم جداً لتحديث النافذة والتقاط الأزرار
       key = cv2.waitKey(1) & 0xFF
-      if key == 27 or key == ord('q'): # ESC أو q للخروج
+      if key == ord("q") or key == ord("Q"):
+        log.info("[SYS] Quit key pressed. Shutting down...")
         break
 
-      # 3. إرسال البيانات للـ ESP32 في Thread منفصل لتجنب أي تعليق في الـ GUI بسبب بطء الشبكة
-      curr_time = time.time()
-      if curr_time - last_post_time >= SEND_INTERVAL:
-        last_post_time = curr_time
-        
-        c1, amb1, _ = lane1.read()
-        c2, amb2, _ = lane2.read()
-
-        # تحديث التايمر بعدد السيارات
-        traffic_timer.update_counts(c1, c2)
-
-        # قراءة حالة حساس الصوت
-        sound_active = sound_state.get()
-
-        # التحقق المزدوج للأسعاف
-        if sound_active and (amb1 or amb2):
-          amb_lane = 1 if amb1 else 2
-          if amb1 and amb2:
-            amb_lane = 1 if c1 <= c2 else 2
-          traffic_timer.set_emergency(amb_lane)
-
-        # إطلاق خيط الإرسال الخلفي لعدم تعليق الواجهة
-        threading.Thread(
-          target=send_to_esp32,
-          args=(lane1, lane2, sound_active),
-          daemon=True,
-          name="HTTP-Post-Thread"
-        ).start()
-
-      # نوم قصير جداً لتجنب إشغال المعالج بنسبة 100% في الـ Loop الرئيسي
-      time.sleep(0.005)
-
   except KeyboardInterrupt:
-    pass
+    log.info("[SYS] Interrupted by user.")
+  finally:
+    stop_event.set()
+    t_cam1.join(timeout=2.0)
+    t_cam2.join(timeout=2.0)
+    t_poll.join(timeout=2.0)
+    t_timer.join(timeout=2.0)
+    cv2.destroyAllWindows()
+    log.info("[SYS] Clean shutdown complete.")
 
-  log.info("\n[SYS] Stopping...")
-  stop_event.set()
-  t_cam1.join(timeout=2)
-  t_cam2.join(timeout=2)
-  t_sound.join(timeout=2)
-  t_timer.join(timeout=2)
-  cv2.destroyAllWindows()
-  log.info("[SYS] Shutdown complete.")
 
-# ============================================================
 if __name__ == "__main__":
   main()
